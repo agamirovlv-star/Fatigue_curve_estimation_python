@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import least_squares
 from typing import List, Tuple, Dict
 
 # ===========================================================
@@ -13,12 +13,11 @@ def sn_curve_model(sigma: np.ndarray, sigma_inf: float, C: float, m: float,
     sigma_adj = sigma - sigma_inf
     sigma_adj = np.maximum(sigma_adj, 1e-6)
     if ku == 0:
-        # Модель для ku=0: возвращает N (долговечность в циклах)
-        return 10 ** ((np.log10(C) - np.log10(sigma_adj)) / m)
+        return 10**((np.log10(C) - np.log10(sigma_adj)) / m)
     else:
-        # Модель для ku=1: возвращает lgN
         return (np.log10(C) - np.log10(sigma_adj)) / m
 
+#========================================================================================
 
 def sigma_from_lgN(lgN: float, sigma_inf: float, C: float, m: float, ku: int) -> float:
     """вычисление напряжения по долговечности"""
@@ -26,7 +25,6 @@ def sigma_from_lgN(lgN: float, sigma_inf: float, C: float, m: float, ku: int) ->
         return sigma_inf + C * (lgN) ** (-m)
     else:
         return sigma_inf + C * (10 ** lgN) ** (-m)
-
 
 # ===========================================================
 # НАЧАЛЬНЫЕ ПАРАМЕТРЫ
@@ -58,7 +56,7 @@ def theoretical_std_sigma_R(sigma_inf: float, C: float, m: float, ku: int,
         ku - тип модели (0 или 1)
         cx - экспериментальные напряжения
         lgN_levels - экспериментальные логарифмы долговечностей
-        slgN - среднеквадратичные отклонения lgN
+        w - весовая функция
         ni - количество образцов на каждом уровне
         N0 - базовая долговечность
     """
@@ -72,19 +70,13 @@ def theoretical_std_sigma_R(sigma_inf: float, C: float, m: float, ku: int,
     ln10 = np.log(10)
     
     # Производные для матрицы чувствительности
-    if ku == 0:
-        # Для модели: lgN = (sigma - sigma_inf)/C)^(-1 / m)
-        # Производная по sigma_inf
+    if ku==0:
         d_dsigma_inf = (1.0 / (m * C)) * ((sigma_adj / C) ** (-1.0/m - 1.0))
         d_dC = (1.0 / (m * C)) * ((sigma_adj / C) ** (-1.0/m))
         d_dm = ((sigma_adj / C) ** (-1.0/m)) * np.log(sigma_adj / C) * (1.0 / m**2)
-    else:
-        # Для модели: lgN =(log10(C) - log10(sigma - sigma_inf)) / m
-        # Производная по sigma_inf
+    if ku==1:
         d_dsigma_inf = (1.0 / m) * (1.0 / (ln10 * sigma_adj))
-        # Производная по C
         d_dC = (1.0 / m) * (1.0 / (ln10 * C))*np.ones_like(sigma_levels)
-        # Производная по m
         d_dm = -(1.0 / m ** 2) * (np.log10(C) - np.log10(sigma_adj))
     
     J = np.column_stack([d_dsigma_inf, d_dC, d_dm])
@@ -118,18 +110,34 @@ def theoretical_std_sigma_R(sigma_inf: float, C: float, m: float, ku: int,
     var_sigma_R = dR @ Cov @ dR
     return np.sqrt(max(var_sigma_R, 0.0))
 
-# ===========================================================
-# ФУНКЦИЯ ДЛЯ curve_fit (обертка с фиксированными ku и cx_min)
-# ===========================================================
-
-def make_model_func(ku: int, cx_min: float):
-    def model_func(sigma, sigma_inf, C, m):
-        return sn_curve_model(sigma, sigma_inf, C, m, ku, cx_min)
-    return model_func
-
 
 # ===========================================================
-# ОСНОВНАЯ ФУНКЦИЯ ОЦЕНКИ (method='lm')
+# ФУНКЦИЯ ДЛЯ least_squares (взвешенный МНК)
+# ===========================================================
+
+def residuals(params: np.ndarray, sigma: np.ndarray, lgN: np.ndarray, 
+              w: np.ndarray, ku: int, cx_min: float) -> np.ndarray:
+    """Функция невязок для взвешенного МНК"""
+    sigma_inf, C, m = params
+    
+    # Штрафы
+    if sigma_inf < 0 or sigma_inf > cx_min - 1.0 or m < 0.0 or m > 10.0 or C < 0:
+        return np.full_like(lgN, 1e20)
+    
+    sigma_adj = sigma - sigma_inf
+    sigma_adj = np.maximum(sigma_adj, 1e-6)
+    
+    if ku == 0:
+        y_pred =  10**((np.log10(C) - np.log10(sigma_adj)) / m)
+    else:
+        y_pred = (np.log10(C) - np.log10(sigma_adj)) / m
+    
+    # Взвешенные невязки
+    return np.sqrt(w) * (y_pred - lgN)
+
+
+# ===========================================================
+# ОСНОВНАЯ ФУНКЦИЯ ОЦЕНКИ (ручной взвешенный МНК)
 # ===========================================================
 
 def estimate_fatigue_curve(cx: List[float], ni: List[int], 
@@ -144,45 +152,66 @@ def estimate_fatigue_curve(cx: List[float], ni: List[int],
     logC_init, m_init = compute_initial_parameters(cx, lgN, sigma_inf_guess, ku)
     C_guess = 10 ** logC_init
     
-    # Создаем модель с фиксированными ku
     cx_min = cx[-1]
-    model_func = make_model_func(ku, cx_min)
     
-    # Метод 'lm' не поддерживает bounds, используем только p0 и maxfev
-    # Штрафы уже внутри model_func
-    popt, pcov, infodict, mesg, ier = curve_fit(
-        model_func, cx, lgN,
-        p0=[sigma_inf_guess, C_guess, m_init],
-        maxfev=10000,
-        ftol=1e-12,
-        xtol=1e-12,
+    # Взвешенный МНК через least_squares
+    result = least_squares(
+        residuals,
+        x0=[sigma_inf_guess, C_guess, m_init],
+        args=(cx, lgN, w, ku, cx_min),
         method='lm',
-        full_output=True
+        max_nfev=10000,
+        ftol=1e-12,
+        xtol=1e-12
     )
     
-    sigma_inf_est, C_est, m_est = popt
+    sigma_inf_est, C_est, m_est = result.x
     log10C_est = np.log10(C_est)
     
-    # Предсказанные значения и невязки
-    y_pred = model_func(cx, sigma_inf_est, C_est, m_est)
-    residuals = y_pred - lgN
-    Q = np.sum(w * residuals ** 2) / np.sum(w)
+    # Предсказанные значения
+    sigma_adj = cx - sigma_inf_est
+    sigma_adj = np.maximum(sigma_adj, 1e-6)
+    if ku == 0:
+        y_pred = 10**((np.log10(C_est) - np.log10(sigma_adj)) / m_est)
+    else:
+        y_pred = (np.log10(C_est) - np.log10(sigma_adj)) / m_est
     
-    # Стандартные ошибки
-    se_sigma_inf = np.sqrt(max(pcov[0, 0], 0))
-    se_C = np.sqrt(max(pcov[1, 1], 0))
-    se_m = np.sqrt(max(pcov[2, 2], 0))
+    residuals_arr = y_pred - lgN
+    Q = np.sum(w * residuals_arr ** 2) / np.sum(w)
+    
+    # Аппроксимация ковариационной матрицы через якобиан
+    try:
+        eps = 1e-8
+        J = []
+        for i in range(3):
+            x_plus = result.x.copy()
+            x_minus = result.x.copy()
+            x_plus[i] += eps
+            x_minus[i] -= eps
+            r_plus = residuals(x_plus, cx, lgN, w, ku, cx_min)
+            r_minus = residuals(x_minus, cx, lgN, w, ku, cx_min)
+            deriv = (r_plus - r_minus) / (2 * eps)
+            J.append(deriv)
+        J = np.array(J).T
+        JTJ = J.T @ J
+        if np.linalg.cond(JTJ) < 1e30:
+            pcov = np.linalg.inv(JTJ) * (np.sum(residuals_arr**2) / (len(cx) - 3))
+        else:
+            pcov = np.eye(3) * 1e10
+        se_sigma_inf = np.sqrt(max(pcov[0, 0], 0))
+        se_C = np.sqrt(max(pcov[1, 1], 0))
+        se_m = np.sqrt(max(pcov[2, 2], 0))
+    except:
+        pcov = np.eye(3)
+        se_sigma_inf = se_C = se_m = 0
     
     # Расчетные напряжения для сравнения
     sigma_calc_list = []
     for i in range(len(cx)):
         sigma_calc_list.append(sigma_from_lgN(lgN[i], sigma_inf_est, C_est, m_est, ku))
     
-    # Количество вызовов функции (nfev)
-    nfev = infodict.get('nfev', 'N/A')
-    
     return {
-        'success': ier in [1, 2, 3, 4],
+        'success': result.success,
         'ku': ku,
         'sigma_inf': sigma_inf_est,
         'C': C_est,
@@ -191,7 +220,7 @@ def estimate_fatigue_curve(cx: List[float], ni: List[int],
         'Q': Q,
         'covariance': pcov,
         'std_errors': [se_sigma_inf, se_C, se_m],
-        'residuals': residuals,
+        'residuals': residuals_arr,
         'initial_params': {
             'sigma_inf': sigma_inf_guess,
             'C': C_guess,
@@ -200,7 +229,7 @@ def estimate_fatigue_curve(cx: List[float], ni: List[int],
         },
         'y_pred': y_pred,
         'sigma_calc': sigma_calc_list,
-        'nfev': nfev,
-        'ier': ier,
-        'mesg': mesg
+        'nfev': result.nfev,
+        'ier': 1 if result.success else 0,
+        'mesg': result.message
     }
